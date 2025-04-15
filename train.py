@@ -8,7 +8,7 @@ import numpy as np
 import time
 import os
 import random
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion-matrix
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from Dataset import HistologyTileDataset, create_dataloaders 
 
 def parse_args():
@@ -130,7 +130,7 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         all_labels, all_preds = [], []
         
         for inputs, labels in train_loader:
-            inputs, labels = inputs.to_device(), labels.to_device()
+            inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
 
             with torch.set_grad_enabled(True):
@@ -154,9 +154,6 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
             print(f'  {k}: {v:.4f}')
 
         if (epoch + 1) % validate_every == 0 or epoch == num_epochs - 1:
-            model.eval()
-            running_loss, all_labels, all_preds = 0.0, [], []
-
             model.eval()
             running_loss, all_labels, all_preds = 0.0, [], []
 
@@ -191,7 +188,7 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
     return model, history
 
 
-def plot_training_history(history):
+def plot_training_history(history, samples_per_class):
     import matplotlib.pyplot as plt
     plt.figure(figsize=(12, 8))
     plt.subplot(2, 3, 1)
@@ -200,7 +197,7 @@ def plot_training_history(history):
     plt.title('Loss')
     plt.legend(['Train', 'Val'])
 
-    metrics = ['accuracy', 'precision', 'recall', 'sensitivity', 'specificity', 'f1']
+    metrics = ['accuracy', 'precision', 'recall', 'f1']
     for i, metric in enumerate(metrics):
         plt.subplot(2, 3, i+1)
         plt.plot([m[metric] for m in history['train_metrics']])
@@ -214,7 +211,7 @@ def plot_training_history(history):
     plt.show()   
 
 
-if __name__ = '__main__':
+if __name__ == '__main__':
 
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok = True)
@@ -242,4 +239,4 @@ if __name__ = '__main__':
         'history': history,
     }, 'training_history/models/final_model.pth')
 
-    plot_training_history(history)
+    plot_training_history(history, args.samples_per_class)
