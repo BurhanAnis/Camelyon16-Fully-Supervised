@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,47 +8,103 @@ import numpy as np
 import time
 import os
 import random
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-from tqdm import tqdm
-from Dataset import HistologyTileDataset, create_dataloaders
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion-matrix
+from Dataset import HistologyTileDataset, create_dataloaders 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description = 'Tile-level Binary Classifier')
+
+    # Data paths
+    parser.add_argument('--pos_slide_path', type=str, required=True,
+                        help='Directory containing positive (tumor) WSI slides')
+    parser.add_argument('--neg_slide_path', type=str, required=True,
+                        help='Directory containing negative (non-tumor) WSI slides')
+    parser.add_argument('--pos_grid_path', type=str, required=True,
+                        help='Path to pickle file with positive tile coordinates')
+    parser.add_argument('--neg_grid_path', type=str, required=True,
+                        help='Path to pickle file with negative tile coordinates')
+
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for training (default: 8)')
+    parser.add_argument('--tile_size', type=int, default=256,
+                        help='Size of tiles to extract (default: 256)')
+    parser.add_argument('--samples_per_class', type=int, default=2000,
+                        help='Number of samples to use per class (default: 2000)')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of worker processes for data loading (default: 8)')
+    parser.add_argument('--num_epochs', type=int, default=25,
+                        help='Number of epochs to train (default: 25)')
+    parser.add_argument('--validate_every', type=int, default=5,
+                        help='Validate model every N epochs (default: 5)')
+
+    # Output parameters
+    parser.add_argument('--save_dir', type=str, default='training_history',
+                        help='Directory to save models (default: training_history)')
+    
+    return parser.parse_args()
 
 
-def set_seed(seed=42):
+def set_seed(seed = 10):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-set_seed(42)
 
-device = torch.device("mps" if torch.backends.mps.is_available() else
-                      "cuda" if torch.cuda.is_available() else "cpu")
+set_seed()
+
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
 def calculate_metrics(y_true, y_pred):
     y_true = y_true.cpu().numpy()
     y_pred = y_pred.cpu().numpy()
-    
-    precision = precision_score(y_true, y_pred, average='binary')
-    recall = recall_score(y_true, y_pred, average='binary')
-    f1 = f1_score(y_true, y_pred, average='binary')
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    sensitivity = recall
-    specificity = tn / (tn + fp)
-    accuracy = (tp + tn) / (tp + tn + fp + fn)
-    
+
+    precision = precision_score(y_true, y_pred, average = 'binary', zero_division=0)
+    recall = recall_score(y_true, y_pred, average = 'binary', zero_division=0) 
+    f1 = f1_score(y_true, y_pred, average = 'binary', zero_division=0) 
+    try:
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel() 
+        accuracy = (tp + tn) / (tp + fp + fn + tn) 
+    except:
+        accuracy = 0
+
+
     return {
+
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
-        'sensitivity': sensitivity,
-        'specificity': specificity,
         'f1': f1
     }
 
 
-def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=25, validate_every=5):
-    since = time.time()
+class SaveBestModel:
+    def __init__(self, best_valid_metric = 0.0, metric_name = 'f1', save_dir = 'models'):
+        self.best_valid_metric = best_valid_metric
+        self.metric_name = metric_name
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok = True)
+
+    
+
+    def __call__(self, current_valid_metric, epoch, model, optimizer, metrics):
+        if current_valid_metric > self.best_valid_metric:
+            self.best_valid_metric = current_valid_metric
+            print(f"\nBest validation {self.metric_name}: {self.best_valid_metric:.4f}")
+            print(f"Saving best model for epoch: {epoch+1}\n")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'metrics': metrics,
+            }, os.path.join(self.save_dir, 'best_model.pth'))
+
+
+def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs = 25, validate_every=5):
+    
     best_model_wts = model.state_dict()
     best_f1 = 0.0
 
@@ -56,12 +113,13 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         'val_loss': [],
         'train_metrics': [],
         'val_metrics': []
+
     }
 
     print(f"Training on device: {device}")
     print(f"Train size: {len(train_loader.dataset)} | Val size: {len(val_loader.dataset)}")
     print(f"Batch size: {train_loader.batch_size}")
-    print("-" * 50)
+    print("-" * 50)  
 
     for epoch in range(num_epochs):
         print(f'Epoch {epoch+1}/{num_epochs}')
@@ -70,10 +128,9 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         model.train()
         running_loss = 0.0
         all_labels, all_preds = [], []
-
-        train_pbar = tqdm(train_loader, desc="Training")
-        for inputs, labels in train_pbar:
-            inputs, labels = inputs.to(device), labels.to(device)
+        
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to_device(), labels.to_device()
             optimizer.zero_grad()
 
             with torch.set_grad_enabled(True):
@@ -99,10 +156,12 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         if (epoch + 1) % validate_every == 0 or epoch == num_epochs - 1:
             model.eval()
             running_loss, all_labels, all_preds = 0.0, [], []
-            val_pbar = tqdm(val_loader, desc="Validating")
+
+            model.eval()
+            running_loss, all_labels, all_preds = 0.0, [], []
 
             with torch.no_grad():
-                for inputs, labels in val_pbar:
+                for inputs, labels in val_loader:
                     inputs, labels = inputs.to(device), labels.to(device)
                     outputs = model(inputs)
                     _, preds = torch.max(outputs, 1)
@@ -150,21 +209,20 @@ def plot_training_history(history):
         plt.legend(['Train', 'Val'])
 
     plt.tight_layout()
-    os.makedirs('histology_models', exist_ok=True)
-    plt.savefig('histology_models/training_history.png')
-    plt.show()
+    os.makedirs('training_history', exist_ok=True)
+    plt.savefig(f'training_history/training_history{samples_per_class}.png')
+    plt.show()   
 
-if __name__ == '__main__':
-    # Paths
-    pos_slide_path = '/Volumes/BurhanAnisExtDrive/camelyon/camelyon_data/training/positive/images'
-    neg_slide_path = '/Volumes/BurhanAnisExtDrive/camelyon/camelyon_data/training/negative'
-    pos_grid_path = '/Users/burhananis/fully-supervised-camelyon/data/tumour_grid.pkl'
-    neg_grid_path = '/Users/burhananis/fully-supervised-camelyon/data/tile_coords_neg.pkl'
+
+if __name__ = '__main__':
+
+    args = parse_args()
+    os.makedirs(args.save_dir, exist_ok = True)
 
     train_loader, val_loader = create_dataloaders(
-        pos_slide_path, neg_slide_path,
-        pos_grid_path, neg_grid_path,
-        batch_size=8, tile_size=256, samples_per_class=2000, num_workers=8
+        args.pos_slide_path, args.neg_slide_path,
+        args.pos_grid_path, args.neg_grid_path,
+        args.batch_size, args.tile_size, args.samples_per_class, args.num_workers
     )
 
     model = models.resnet50(weights='IMAGENET1K_V1')
@@ -174,14 +232,14 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-    save_best_model = SaveBestModel(metric_name='f1', save_dir='histology_models')
+    save_best_model = SaveBestModel(metric_name='f1', save_dir='training_history/models')
 
-    model, history = train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=25, validate_every=5)
+    model, history = train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, args.num_epochs, args.validate_every)
 
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'history': history,
-    }, 'histology_models/final_model.pth')
+    }, 'training_history/models/final_model.pth')
 
     plot_training_history(history)
