@@ -1,4 +1,6 @@
 import argparse
+import psutil
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +12,11 @@ import os
 import random
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from Dataset import HistologyTileDataset, create_dataloaders 
+
+def get_gpu_memory():
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024**2  # in MB
+    return 0.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description = 'Tile-level Binary Classifier')
@@ -104,6 +111,16 @@ class SaveBestModel:
 
 
 def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs = 25, validate_every=5):
+
+    log_file = os.path.join('training_history', 'training_log.txt')
+    with open(log_file, 'w') as f:
+        f.write(f"Training started at {datetime.now()}\n")
+        f.write(f"Device: {device}\n")
+        f.write(f"Batch size: {train_loader.batch_size}, Num workers: {train_loader.num_workers}\n")
+        f.write("-" * 80 + "\n")
+
+    total_start_time = time.time()
+
     
     best_model_wts = model.state_dict()
     best_f1 = 0.0
@@ -125,6 +142,14 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         print(f'Epoch {epoch+1}/{num_epochs}')
         print('-' * 10)
 
+        epoch_start_time = time.time()
+        mem_start = psutil.virtual_memory().used / (1024 ** 3)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            gpu_start = torch.cuda.memory_allocated() / 1024**2
+        else:
+            gpu_start = 0.0
+
         model.train()
         running_loss = 0.0
         all_labels, all_preds = [], []
@@ -144,6 +169,15 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
 
+        epoch_end_time = time.time()
+        mem_end = psutil.virtual_memory().used / (1024 ** 3)
+        cpu_percent = psutil.cpu_percent(interval=epoch_end_time - epoch_start_time)
+        gpu_end = get_gpu_memory()
+        if torch.cuda.is_available():
+            gpu_peak = torch.cuda.max_memory_allocated() / 1024**2
+        else:
+            gpu_peak = 0.0
+
         epoch_loss = running_loss / len(train_loader.dataset)
         train_metrics = calculate_metrics(torch.tensor(all_labels), torch.tensor(all_preds))
         history['train_loss'].append(epoch_loss)
@@ -152,6 +186,16 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         print(f'Train Loss: {epoch_loss:.4f}')
         for k, v in train_metrics.items():
             print(f'  {k}: {v:.4f}')
+
+
+        with open(log_file, 'a') as f:
+            f.write(f"Epoch {epoch + 1}/{num_epochs}\n")
+            f.write(f"  Time: {epoch_end_time - epoch_start_time:.2f}s\n")
+            f.write(f"  CPU usage: {cpu_percent:.2f}%\n")
+            f.write(f"  Memory used: {mem_end - mem_start:.2f} GB\n")
+            f.write(f"  GPU memory used: {gpu_end - gpu_start:.2f} MB\n")
+            f.write(f"  Peak GPU memory used: {gpu_peak:.2f} MB\n")
+
 
         if (epoch + 1) % validate_every == 0 or epoch == num_epochs - 1:
             model.eval()
@@ -183,6 +227,11 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
                 best_model_wts = model.state_dict()
 
         scheduler.step()
+
+    total_time = time.time() - total_start_time
+    with open(log_file, 'a') as f:
+        f.write(f"\nTraining completed at {datetime.now()}\n")
+        f.write(f"Total training time: {total_time:.2f} seconds\n")
 
     model.load_state_dict(best_model_wts)
     return model, history
