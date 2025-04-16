@@ -14,6 +14,7 @@ import torch
 import torch.utils.data as data
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
+import time
 
 class HistologyTileDataset(Dataset):
     def __init__(self, pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_path, 
@@ -61,8 +62,7 @@ class HistologyTileDataset(Dataset):
 
     def _prepare_samples(self, grid, label, num_samples):
         """Prepare samples from a grid with associated label"""
-
-        total_samples = sum(len(tiles) for tiles in grid)
+        total_samples = sum(len(tiles) for tiles in grid)  # total number of available tile coordinates
         samples = []
 
         if total_samples <= num_samples:
@@ -74,40 +74,40 @@ class HistologyTileDataset(Dataset):
                         'tile_idx': tile_idx,
                         'label': label
                     })
-            
-            # If we need more samples, duplicate random ones
+
+            # If we need more, sample with replacement
             if len(samples) < num_samples:
-                extra_samples = random.choices(samples, k=num_samples-len(samples))
+                extra_samples = random.choices(samples, k=num_samples - len(samples))
                 samples.extend(extra_samples)
+
         else:
-            # Create a fraction of all possible samples to avoid memory issues
+            # Limit memory: sample a random subset of tile locations
             fraction = min(1.0, 2.0 * num_samples / total_samples)
-        
-        # Create list of all possible (slide_idx, tile_idx) combinations
-        for slide_idx, tiles in enumerate(grid):
-                    # Random sampling to keep memory usage reasonable
+
+            for slide_idx, tiles in enumerate(grid):
+                for tile_idx in range(len(tiles)):
                     if random.random() <= fraction:
                         samples.append({
                             'slide_idx': slide_idx,
                             'tile_idx': tile_idx,
                             'label': label
                         })
-        
-            # Final random selection to get exact count
+
+            # Ensure we return exactly num_samples
             if len(samples) > num_samples:
                 samples = random.sample(samples, num_samples)
             elif len(samples) < num_samples:
-                # Need more samples
-                extra_samples = random.choices(samples, k=num_samples-len(samples))
+                extra_samples = random.choices(samples, k=num_samples - len(samples))
                 samples.extend(extra_samples)
-                
+
         return samples
 
-def _group_by_slide(self, samples):
-        """Group samples by slide to improve cache hit rate"""
-        # Sort samples by slide_idx to improve cache locality
-        samples.sort(key=lambda x: (x['label'], x['slide_idx']))
-        return samples
+
+    def _group_by_slide(self, samples):
+            """Group samples by slide to improve cache hit rate"""
+            # Sort samples by slide_idx to improve cache locality
+            samples.sort(key=lambda x: (x['label'], x['slide_idx']))
+            return samples
 
     def __len__(self):
         return len(self.samples)
@@ -253,4 +253,4 @@ def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_p
         persistent_workers=persistent_workers
     )
     
-    return train_loader, val_loader    
+    return train_loader, val_loader     
