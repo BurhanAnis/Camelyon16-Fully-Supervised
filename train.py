@@ -133,7 +133,7 @@ class SaveBestModel:
             }, os.path.join(self.save_dir, 'best_model.pth'))
 
 
-def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=25, validate_every=5, save_dir='training_history'):
+def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=25, validate_every=5, save_dir='training_history', device = None):
     """Optimized training loop that reduces tensor operations and eliminates bottlenecks"""
     log_file = os.path.join(save_dir, 'training_log.txt')
     with open(log_file, 'w') as f:
@@ -369,7 +369,8 @@ if __name__ == '__main__':
         val_loader, 
         args.num_epochs, 
         args.validate_every, 
-        save_dir = args.save_dir
+        save_dir = args.save_dir,
+        device = device
         )
 
     torch.save({
