@@ -17,7 +17,7 @@ import torchvision.transforms as transforms
 
 class HistologyTileDataset(Dataset):
     def __init__(self, pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_path, 
-                 tile_size=256, transform=None, samples_per_class=5000):
+                 tile_size=256, transform=None, samples_per_class=5000, cache_size = 5):
         """
         Args:
             pos_slide_path (str): Directory containing positive (tumor) WSI slides
@@ -32,6 +32,7 @@ class HistologyTileDataset(Dataset):
         self.neg_slide_path = neg_slide_path
         self.tile_size = tile_size
         self.transform = transform
+        self.cache_size = cache_size
         
         # Load coordinate grids
         with open(pos_grid_path, 'rb') as f:
@@ -43,39 +44,69 @@ class HistologyTileDataset(Dataset):
         # Get slide names
         self.pos_slides = [f for f in os.listdir(pos_slide_path) if f.endswith('.tif')]
         self.neg_slides = [f for f in os.listdir(neg_slide_path) if f.endswith('.tif')]
+        self.pos_slide_full_paths = [os.path.join(pos_slide_path, slide) for slide in self.pos_slides]
+        self.neg_slide_full_paths = [os.path.join(neg_slide_path, slide) for slide in self.neg_slides]
+
         
         # Prepare sample indices
         self.pos_samples = self._prepare_samples(self.pos_grid, 1, samples_per_class)
         self.neg_samples = self._prepare_samples(self.neg_grid, 0, samples_per_class)
+
+        # Group samples by slide to improve cache locality
+        self.samples = self._group_by_slide(self.pos_samples + self.neg_samples)
         
-        # Combine samples
-        self.samples = self.pos_samples + self.neg_samples
-        random.shuffle(self.samples)
-        
-        # Cache for open slides to improve performance
+        # LRU cache for slide objects to improve performance
         self.slide_cache = {}
+        self.slide_cache_usage = {}  # Track last usage time for each slid
 
     def _prepare_samples(self, grid, label, num_samples):
         """Prepare samples from a grid with associated label"""
+
+        total_samples = sum(len(tiles) for tiles in grid)
         samples = []
-        all_possible_samples = []
+
+        if total_samples <= num_samples:
+            # Use all samples and sample with replacement if needed
+            for slide_idx, tiles in enumerate(grid):
+                for tile_idx in range(len(tiles)):
+                    samples.append({
+                        'slide_idx': slide_idx,
+                        'tile_idx': tile_idx,
+                        'label': label
+                    })
+            
+            # If we need more samples, duplicate random ones
+            if len(samples) < num_samples:
+                extra_samples = random.choices(samples, k=num_samples-len(samples))
+                samples.extend(extra_samples)
+        else:
+            # Create a fraction of all possible samples to avoid memory issues
+            fraction = min(1.0, 2.0 * num_samples / total_samples)
         
         # Create list of all possible (slide_idx, tile_idx) combinations
         for slide_idx, tiles in enumerate(grid):
-            for tile_idx in range(len(tiles)):
-                all_possible_samples.append({
-                    'slide_idx': slide_idx,
-                    'tile_idx': tile_idx,
-                    'label': label
-                })
+                    # Random sampling to keep memory usage reasonable
+                    if random.random() <= fraction:
+                        samples.append({
+                            'slide_idx': slide_idx,
+                            'tile_idx': tile_idx,
+                            'label': label
+                        })
         
-        # Randomly select num_samples
-        if len(all_possible_samples) > num_samples:
-            samples = random.sample(all_possible_samples, num_samples)
-        else:
-            # If we don't have enough samples, use all and sample with replacement
-            samples = random.choices(all_possible_samples, k=num_samples)
-        
+            # Final random selection to get exact count
+            if len(samples) > num_samples:
+                samples = random.sample(samples, num_samples)
+            elif len(samples) < num_samples:
+                # Need more samples
+                extra_samples = random.choices(samples, k=num_samples-len(samples))
+                samples.extend(extra_samples)
+                
+        return samples
+
+def _group_by_slide(self, samples):
+        """Group samples by slide to improve cache hit rate"""
+        # Sort samples by slide_idx to improve cache locality
+        samples.sort(key=lambda x: (x['label'], x['slide_idx']))
         return samples
 
     def __len__(self):
@@ -89,34 +120,19 @@ class HistologyTileDataset(Dataset):
         
         # Determine which set of slides and grid to use
         if label == 1:  # Positive/tumor
-            slide_path = self.pos_slide_path
-            slides = self.pos_slides
+            slide_path = self.pos_slide_full_paths[slide_idx]
             grid = self.pos_grid
         else:  # Negative/non-tumor
-            slide_path = self.neg_slide_path
-            slides = self.neg_slides
+            slide_path = self.neg_slide_full_paths[slide_idx]
             grid = self.neg_grid
-        
-        # Get slide filename
-        slide_filename = slides[slide_idx]
-        full_slide_path = os.path.join(slide_path, slide_filename)
-        
+
         # Get tile coordinates
         x, y = grid[slide_idx][tile_idx]
         
-        # Load slide (use cache for efficiency)
-        if full_slide_path not in self.slide_cache:
-            self.slide_cache[full_slide_path] = openslide.OpenSlide(full_slide_path)
-            
-            # Implement a simple cache size limit
-            if len(self.slide_cache) > 10:  # Keep only 10 slides in memory
-                # Remove a random slide from cache
-                remove_key = random.choice(list(self.slide_cache.keys()))
-                if remove_key != full_slide_path:
-                    del self.slide_cache[remove_key]
-                    
-        slide = self.slide_cache[full_slide_path]
-        
+        # Load slide (use LRU cache for efficiency)
+        slide = self._get_slide(slide_path)
+
+
         # Extract tile
         tile = slide.read_region((x, y), 0, (self.tile_size, self.tile_size))
         tile = tile.convert('RGB')
@@ -131,9 +147,34 @@ class HistologyTileDataset(Dataset):
         
         return tile, label
 
+    def _get_slide(self, slide_path):
+        """Get slide from cache with LRU replacement policy"""
+        # Update usage time for this slide
+        current_time = time.time()
+        
+        if slide_path in self.slide_cache:
+            # Update last access time
+            self.slide_cache_usage[slide_path] = current_time
+            return self.slide_cache[slide_path]
+        
+        # Load new slide
+        slide = openslide.OpenSlide(slide_path)
+        self.slide_cache[slide_path] = slide
+        self.slide_cache_usage[slide_path] = current_time
+        
+        # Check if cache is full
+        if len(self.slide_cache) > self.cache_size:
+            # Find least recently used slide
+            lru_slide = min(self.slide_cache_usage.items(), key=lambda x: x[1])[0]
+            # Remove it from cache
+            del self.slide_cache[lru_slide]
+            del self.slide_cache_usage[lru_slide]
+            
+        return slide
+
 def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_path, 
                        batch_size=32, tile_size=256, samples_per_class=5000, 
-                       num_workers=4, val_split=0.2):
+                       num_workers=4, val_split=0.2, prefetch_factor=2, persistent_workers = True):
     """
     Create training and validation dataloaders
     
@@ -147,6 +188,8 @@ def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_p
         samples_per_class (int): Number of samples to use per class
         num_workers (int): Number of worker processes for data loading
         val_split (float): Fraction of data to use for validation
+        prefetch_factor (int): Number of batches loaded in advance by each worker
+        persistent_workers (bool): Whether to keep worker processes alive between iterations
         
     Returns:
         train_loader, val_loader: DataLoader objects for training and validation
@@ -166,7 +209,7 @@ def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_p
     train_samples = int(samples_per_class * (1 - val_split))
     val_samples = int(samples_per_class * val_split)
     
-    # Create datasets
+    # Create datasets with optimized caching
     train_dataset = HistologyTileDataset(
         pos_slide_path=pos_slide_path,
         neg_slide_path=neg_slide_path,
@@ -174,7 +217,8 @@ def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_p
         neg_grid_path=neg_grid_path,
         tile_size=tile_size,
         transform=train_transform,
-        samples_per_class=train_samples
+        samples_per_class=train_samples,
+        cache_size=min(10, num_workers * 2)  # Optimize cache size based on workers
     )
     
     val_dataset = HistologyTileDataset(
@@ -184,16 +228,19 @@ def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_p
         neg_grid_path=neg_grid_path,
         tile_size=tile_size,
         transform=val_transform,
-        samples_per_class=val_samples
+        samples_per_class=val_samples,
+        cache_size=min(10, num_workers * 2)  # Optimize cache size based on workers
     )
     
-    # Create dataloaders
+    # Create dataloaders with optimized settings
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers
     )
     
     val_loader = DataLoader(
@@ -201,7 +248,9 @@ def create_dataloaders(pos_slide_path, neg_slide_path, pos_grid_path, neg_grid_p
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers
     )
     
     return train_loader, val_loader    

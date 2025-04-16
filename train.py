@@ -32,18 +32,26 @@ def parse_args():
                         help='Path to pickle file with negative tile coordinates')
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size for training (default: 8)')
+    parser.add_argument('--batch_size', type=int, default=32,  # Increased default batch size
+                        help='Batch size for training (default: 32)')
     parser.add_argument('--tile_size', type=int, default=256,
                         help='Size of tiles to extract (default: 256)')
     parser.add_argument('--samples_per_class', type=int, default=2000,
                         help='Number of samples to use per class (default: 2000)')
     parser.add_argument('--num_workers', type=int, default=8,
                         help='Number of worker processes for data loading (default: 8)')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                        help='Number of batches loaded in advance by each worker (default: 2)')
+    parser.add_argument('--persistent_workers', action='store_true',
+                        help='Keep workers alive between iterations')
+    parser.add_argument('--cache_size', type=int, default=5,
+                        help='Number of slides to keep in memory cache (default: 5)')
     parser.add_argument('--num_epochs', type=int, default=25,
                         help='Number of epochs to train (default: 25)')
     parser.add_argument('--validate_every', type=int, default=5,
                         help='Validate model every N epochs (default: 5)')
+    parser.add_argument('--use_amp', action='store_true', 
+                        help='Use automatic mixed precision training')
 
     # Output parameters
     parser.add_argument('--save_dir', type=str, default='training_history',
@@ -60,27 +68,42 @@ def set_seed(seed = 10):
         torch.cuda.manual_seed_all(seed)
 
 
-set_seed()
-
-
-device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-
 def calculate_metrics(y_true, y_pred):
-    y_true = y_true.cpu().numpy()
-    y_pred = y_pred.cpu().numpy()
+    """
+    Calculate evaluation metrics efficiently with minimal tensor conversions
+    
+    Args:
+        y_true: Tensor of ground truth labels
+        y_pred: Tensor of predicted labels
+        
+    Returns:
+        Dictionary of metrics (accuracy, precision, recall, f1)
+    """
+    # Only convert to numpy once
+    if torch.is_tensor(y_true):
+        y_true_np = y_true.cpu().numpy()
+    else:
+        y_true_np = y_true
+        
+    if torch.is_tensor(y_pred):
+        y_pred_np = y_pred.cpu().numpy()
+    else:
+        y_pred_np = y_pred
 
-    precision = precision_score(y_true, y_pred, average = 'binary', zero_division=0)
-    recall = recall_score(y_true, y_pred, average = 'binary', zero_division=0) 
-    f1 = f1_score(y_true, y_pred, average = 'binary', zero_division=0) 
+    # Calculate metrics more efficiently
+    precision = precision_score(y_true_np, y_pred_np, average='binary', zero_division=0)
+    recall = recall_score(y_true_np, y_pred_np, average='binary', zero_division=0) 
+    f1 = f1_score(y_true_np, y_pred_np, average='binary', zero_division=0) 
+    
+    # Calculate confusion matrix only once
     try:
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel() 
+        cm = confusion_matrix(y_true_np, y_pred_np)
+        tn, fp, fn, tp = cm.ravel() 
         accuracy = (tp + tn) / (tp + fp + fn + tn) 
     except:
         accuracy = 0
 
-
     return {
-
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
@@ -110,8 +133,8 @@ class SaveBestModel:
             }, os.path.join(self.save_dir, 'best_model.pth'))
 
 
-def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs = 25, validate_every=5, save_dir = 'training_history'):
-
+def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs=25, validate_every=5, save_dir='training_history'):
+    """Optimized training loop that reduces tensor operations and eliminates bottlenecks"""
     log_file = os.path.join(save_dir, 'training_log.txt')
     with open(log_file, 'w') as f:
         f.write(f"Training started at {datetime.now()}\n")
@@ -120,7 +143,6 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         f.write("-" * 80 + "\n")
 
     total_start_time = time.time()
-
     
     best_model_wts = model.state_dict()
     best_f1 = 0.0
@@ -130,7 +152,6 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
         'val_loss': [],
         'train_metrics': [],
         'val_metrics': []
-
     }
 
     print(f"Training on device: {device}")
@@ -138,6 +159,14 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
     print(f"Batch size: {train_loader.batch_size}")
     print("-" * 50)  
 
+    # Pre-allocate tensors for labels and predictions to avoid repeated allocations
+    all_train_labels = torch.zeros(len(train_loader.dataset), dtype=torch.long)
+    all_train_preds = torch.zeros(len(train_loader.dataset), dtype=torch.long)
+    
+    if validate_every > 0:
+        all_val_labels = torch.zeros(len(val_loader.dataset), dtype=torch.long)
+        all_val_preds = torch.zeros(len(val_loader.dataset), dtype=torch.long)
+    
     for epoch in range(num_epochs):
         print(f'Epoch {epoch+1}/{num_epochs}')
         print('-' * 10)
@@ -152,26 +181,48 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
 
         model.train()
         running_loss = 0.0
-        all_labels, all_preds = [], []
+        training_start_idx = 0
         
-        for inputs, labels in train_loader:
+        # Use automatic mixed precision for faster training if available
+        scaler = torch.cuda.amp.GradScaler() if hasattr(torch.cuda, 'amp') and device.type == 'cuda' else None
+        
+        for batch_idx, (inputs, labels) in enumerate(train_loader):
+            batch_size = inputs.size(0)
             inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-
-            with torch.set_grad_enabled(True):
+            
+            optimizer.zero_grad(set_to_none=True)  # More efficient than just zero_grad()
+            
+            if scaler is not None:
+                # Use mixed precision training
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Regular training
                 outputs = model(inputs)
-                _, preds = torch.max(outputs, 1)
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
-
-            running_loss += loss.item() * inputs.size(0)
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-
+            
+            # Compute predictions without using .item() in the hot loop
+            _, preds = torch.max(outputs, 1)
+            
+            # Store batch statistics
+            running_loss += loss.item() * batch_size
+            
+            # Store labels and predictions directly without converting to numpy
+            end_idx = training_start_idx + batch_size
+            all_train_labels[training_start_idx:end_idx] = labels.cpu()
+            all_train_preds[training_start_idx:end_idx] = preds.cpu()
+            training_start_idx = end_idx
+            
         epoch_end_time = time.time()
         mem_end = psutil.virtual_memory().used / (1024 ** 3)
-        cpu_percent = psutil.cpu_percent(interval=epoch_end_time - epoch_start_time)
+        cpu_percent = psutil.cpu_percent(interval=None)
         gpu_end = get_gpu_memory()
         if torch.cuda.is_available():
             gpu_peak = torch.cuda.max_memory_allocated() / 1024**2
@@ -179,14 +230,19 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
             gpu_peak = 0.0
 
         epoch_loss = running_loss / len(train_loader.dataset)
-        train_metrics = calculate_metrics(torch.tensor(all_labels), torch.tensor(all_preds))
+        
+        # Only calculate metrics once per epoch, not per batch
+        train_metrics = calculate_metrics(
+            all_train_labels[:training_start_idx], 
+            all_train_preds[:training_start_idx]
+        )
+        
         history['train_loss'].append(epoch_loss)
         history['train_metrics'].append(train_metrics)
 
         print(f'Train Loss: {epoch_loss:.4f}')
         for k, v in train_metrics.items():
             print(f'  {k}: {v:.4f}')
-
 
         with open(log_file, 'a') as f:
             f.write(f"Epoch {epoch + 1}/{num_epochs}\n")
@@ -196,23 +252,36 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
             f.write(f"  GPU memory used: {gpu_end - gpu_start:.2f} MB\n")
             f.write(f"  Peak GPU memory used: {gpu_peak:.2f} MB\n")
 
-
-        if (epoch + 1) % validate_every == 0 or epoch == num_epochs - 1:
+        # Validation - only do it periodically to save time
+        if validate_every > 0 and ((epoch + 1) % validate_every == 0 or epoch == num_epochs - 1):
             model.eval()
-            running_loss, all_labels, all_preds = 0.0, [], []
-
+            running_loss = 0.0
+            val_start_idx = 0
+            
             with torch.no_grad():
-                for inputs, labels in val_loader:
+                for batch_idx, (inputs, labels) in enumerate(val_loader):
+                    batch_size = inputs.size(0)
                     inputs, labels = inputs.to(device), labels.to(device)
+                    
                     outputs = model(inputs)
-                    _, preds = torch.max(outputs, 1)
                     loss = criterion(outputs, labels)
-                    running_loss += loss.item() * inputs.size(0)
-                    all_labels.extend(labels.cpu().numpy())
-                    all_preds.extend(preds.cpu().numpy())
-
+                    _, preds = torch.max(outputs, 1)
+                    
+                    running_loss += loss.item() * batch_size
+                    
+                    # Store batch results
+                    end_idx = val_start_idx + batch_size
+                    all_val_labels[val_start_idx:end_idx] = labels.cpu()
+                    all_val_preds[val_start_idx:end_idx] = preds.cpu()
+                    val_start_idx = end_idx
+                    
             val_loss = running_loss / len(val_loader.dataset)
-            val_metrics = calculate_metrics(torch.tensor(all_labels), torch.tensor(all_preds))
+            
+            val_metrics = calculate_metrics(
+                all_val_labels[:val_start_idx],
+                all_val_preds[:val_start_idx]
+            )
+            
             history['val_loss'].append(val_loss)
             history['val_metrics'].append(val_metrics)
 
@@ -235,7 +304,6 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
 
     model.load_state_dict(best_model_wts)
     return model, history
-
 
 def plot_training_history(history, samples_per_class, save_dir='training_history'):
     import matplotlib.pyplot as plt
@@ -266,20 +334,31 @@ if __name__ == '__main__':
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok = True)
 
+    set_seed()
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else 
+                          "cuda" if torch.cuda.is_available() else "cpu")
+
     train_loader, val_loader = create_dataloaders(
         args.pos_slide_path, args.neg_slide_path,
         args.pos_grid_path, args.neg_grid_path,
-        args.batch_size, args.tile_size, args.samples_per_class, args.num_workers
+        args.batch_size, args.tile_size, args.samples_per_class, 
+        args.num_workers, prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers
     )
+
 
     model = models.resnet50(weights='IMAGENET1K_V1')
     model.fc = nn.Linear(model.fc.in_features, 2)
     model.to(device)
 
+    if args.use_amp and device.type == 'cuda' and hasattr(torch.cuda, 'amp'):
+        print("Using Automatic Mixed Precision (AMP) training")
+
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-    save_best_model = SaveBestModel(metric_name='f1', save_dir='training_history/models')
+    save_best_model = SaveBestModel(metric_name='f1', save_dir=os.path.join(args.save_dir, 'models'))
 
     model, history = train_model(
         model, 
@@ -297,6 +376,7 @@ if __name__ == '__main__':
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'history': history,
-    }, 'training_history/models/final_model.pth')
+    }, os.path.join(args.save_dir, 'models', 'final_model.pth'))
+    
 
     plot_training_history(history, args.samples_per_class, save_dir=args.save_dir)
