@@ -110,9 +110,9 @@ class SaveBestModel:
             }, os.path.join(self.save_dir, 'best_model.pth'))
 
 
-def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs = 25, validate_every=5):
+def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, num_epochs = 25, validate_every=5, save_dir = 'training_history'):
 
-    log_file = os.path.join('training_history', 'training_log.txt')
+    log_file = os.path.join(save_dir, 'training_log.txt')
     with open(log_file, 'w') as f:
         f.write(f"Training started at {datetime.now()}\n")
         f.write(f"Device: {device}\n")
@@ -237,8 +237,9 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
     return model, history
 
 
-def plot_training_history(history, samples_per_class):
+def plot_training_history(history, samples_per_class, save_dir='training_history'):
     import matplotlib.pyplot as plt
+
     plt.figure(figsize=(12, 8))
     plt.subplot(2, 3, 1)
     plt.plot(history['train_loss'])
@@ -255,8 +256,8 @@ def plot_training_history(history, samples_per_class):
         plt.legend(['Train', 'Val'])
 
     plt.tight_layout()
-    os.makedirs('training_history', exist_ok=True)
-    plt.savefig(f'training_history/training_history{samples_per_class}.png')
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(os.path.join(save_dir, f'training_history_s{samples_per_class}.png'))
     plt.show()   
 
 
@@ -280,7 +281,17 @@ if __name__ == '__main__':
     scheduler = lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
     save_best_model = SaveBestModel(metric_name='f1', save_dir='training_history/models')
 
-    model, history = train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, args.num_epochs, args.validate_every)
+    model, history = train_model(
+        model, 
+        criterion, 
+        optimizer, 
+        scheduler, 
+        train_loader, 
+        val_loader, 
+        args.num_epochs, 
+        args.validate_every, 
+        save_dir = args.save_dir
+        )
 
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -288,4 +299,4 @@ if __name__ == '__main__':
         'history': history,
     }, 'training_history/models/final_model.pth')
 
-    plot_training_history(history, args.samples_per_class)
+    plot_training_history(history, args.samples_per_class, save_dir=args.save_dir)
